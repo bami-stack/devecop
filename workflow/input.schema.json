@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Security Scan Workflow Input",
+  "description": "Input from n8n previous execution nodes (loop of repositories). One item per repo.",
+  "type": "object",
+  "required": [ "approved" ],
+  "properties": {
+    "approved": {
+      "type": "boolean",
+      "description": "Safety gate. Must be true to allow this execution to run scans / clone repos."
+    },
+    "repoPath": {
+      "type": "string",
+      "description": "Absolute path to the repository directory to scan (from n8n loop item, e.g. {{ $json.repoPath }}). If omitted, provide repoUrl instead."
+    },
+    "repoUrl": {
+      "type": "string",
+      "description": "Optional git URL to clone (e.g. from GitHub node: {{ $json.cloneUrl }}). If provided and repoPath is missing, the workflow will clone/pull into workflow/_repos/<repoName>."
+    },
+    "repoName": {
+      "type": "string",
+      "description": "Optional identifier for report naming; defaults to folder name of repoPath"
+    },
+    "scanContainers": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to run container/image scans if Dockerfile or image refs are found"
+    },
+    "allowInstall": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, workflow may propose installing missing scan tools (with approval)"
+    },
+    "includeRaw": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, embed full raw tool outputs (grype/npm audit) in the JSON report. This can make reports large."
+    }
+  }
+}

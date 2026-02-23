@@ -1,0 +1,26 @@
+# Grype configuration for security scan workflow
+# Use with: grype --config scripts/grype-config.yaml <target>
+# Or copy to .grype.yaml in project root for automatic loading
+
+# Fail scan (exit code 1) if vulnerabilities at or above this severity are found
+# Options: negligible, low, medium, high, critical
+fail-on-severity: "high"
+
+# Globs to exclude from scanning
+exclude:
+  - "./venv/**"
+  - "./.venv/**"
+  - "./.git/**"
+  - "./node_modules/**"
+  - "./__pycache__/**"
+  - "./reports/**"
+
+# Sort results by risk (EPSS/KEV aware) for prioritization
+sort-by: "risk"
+
+# Example: ignore specific CVEs (uncomment and customize as needed)
+# ignore:
+#   - vulnerability: "CVE-XXXX-XXXXX"
+#     fix-state: "wont-fix"
+#     package:
+#       name: "some-package"

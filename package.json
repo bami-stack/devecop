@@ -1,0 +1,16 @@
+{
+  "name": "n8n-cursor-workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "validate": "node scripts/validate-workflows.mjs",
+    "n8n:export": "node scripts/n8n-export-workflows.mjs",
+    "n8n:import": "node scripts/n8n-import-workflows.mjs"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "prettier": "^3.6.2"
+  }
+}

@@ -1,0 +1,69 @@
+name: Repository Security Scan
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # Nightly at 2AM UTC
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security-scan:
+    name: Run Vulnerability Scan
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node (for npm audit if needed)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Grype
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://raw.githubusercontent.com/anchore/grype/main/install.ps1 -OutFile install-grype.ps1
+          .\install-grype.ps1 -InstallDir $env:USERPROFILE\bin
+          echo "$env:USERPROFILE\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Verify Grype installation
+        run: grype version
+        shell: pwsh
+
+      - name: Run Security Scan Script
+        shell: pwsh
+        run: |
+          $env:SECURITY_SCAN_REPO_PATH = "${{ github.workspace }}"
+          .\security-scan.ps1 -RepoName "${{ github.repository }}"
+
+      - name: Upload Security Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: reports/
+
+      - name: Upload Workflow Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-output
+          path: workflow/output.json
+
+      - name: Fail if High/Critical Found
+        shell: pwsh
+        run: |
+          $output = Get-Content workflow/output.json | ConvertFrom-Json
+          if ($output.criticalHigh -gt 0) {
+            Write-Error "High/Critical vulnerabilities detected."
+            exit 1
+          } else {
+            Write-Host "No high/critical vulnerabilities."
+          }
+        
