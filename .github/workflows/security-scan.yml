@@ -41,11 +41,14 @@ jobs:
 
       - name: Verify Grype installation
         run: grype version
+      
+      - name: Make scan script executable
+        run: chmod +x scripts/run-scan.sh
 
       - name: Run Security Scan Script
         run: |
           export SECURITY_SCAN_REPO_PATH="${{ github.workspace }}"
-          bash security-scan.sh --repo-name "${{ github.repository }}"
+          bash scripts/run-scan.sh --repo-name "${{ github.repository }}"
 
       - name: Upload Security Report
         uses: actions/upload-artifact@v4
