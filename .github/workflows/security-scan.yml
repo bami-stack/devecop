@@ -78,7 +78,7 @@ jobs:
             -X POST \
             -H "Content-Type: application/json" \
             -d @workflow/output-final.json \
-            "https://n8ndev.dedamdata.org/webhook/27bc0c35-a997-45a6-b97c-28f430487a6a"
+            "https://n8ndev.dedamdata.org/webhook/security-scan"
 
       - name: Fail if High/Critical Found
         run: |
