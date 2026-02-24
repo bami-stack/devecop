@@ -1,4 +1,4 @@
-# n8n + GitAction workflow repo
+## Automated DevSecop using N8n and Git Action
 
 This repo is set up to:
 
