@@ -1,203 +1,207 @@
+#!/usr/bin/env bash
 # Security Scan Runner - one repo per execution (for n8n loop integration)
-# Reads input from: env SECURITY_SCAN_REPO_PATH, workflow/input.json, or first argument.
+# Reads input from: env SECURITY_SCAN_REPO_PATH, workflow/input.json, or --repo-path argument.
 # Writes: reports/security_scan_<repoName>_<date>.md and workflow/output.json for n8n.
 
-param(
-    [Parameter(Position = 0)]
-    [string] $RepoPath,
-    [string] $RepoName,
-    [switch] $ScanContainers = $true,
-    [string] $SecurityScanRoot = $PSScriptRoot + "\.."
-)
+set -euo pipefail
 
-$ErrorActionPreference = "Stop"
-$SecurityScanRoot = (Resolve-Path $SecurityScanRoot).Path
-$WorkflowDir = Join-Path $SecurityScanRoot "workflow"
-$ReportsDir = Join-Path $SecurityScanRoot "reports"
-$ScriptsDir = Join-Path $SecurityScanRoot "scripts"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECURITY_SCAN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKFLOW_DIR="$SECURITY_SCAN_ROOT/workflow"
+REPORTS_DIR="$SECURITY_SCAN_ROOT/reports"
+SCRIPTS_DIR="$SECURITY_SCAN_ROOT/scripts"
 
-# --- Resolve input (n8n loop item) ---
-if (-not $RepoPath -and $env:SECURITY_SCAN_REPO_PATH) {
-    $RepoPath = $env:SECURITY_SCAN_REPO_PATH
-}
-if (-not $RepoPath) {
-    $inputFile = Join-Path $WorkflowDir "input.json"
-    if (Test-Path $inputFile) {
-        $input = Get-Content $inputFile -Raw | ConvertFrom-Json
-        $RepoPath = $input.repoPath
-        if (-not $RepoName -and $input.repoName) { $RepoName = $input.repoName }
-        if ($null -ne $input.scanContainers) { $ScanContainers = [bool]$input.scanContainers }
-    }
-}
-if (-not $RepoPath) {
-    Write-Error "Repo path required. Set SECURITY_SCAN_REPO_PATH, pass -RepoPath, or set workflow/input.json repoPath."
-    exit 1
-}
+REPO_PATH=""
+REPO_NAME=""
+SCAN_CONTAINERS=true
 
-$RepoPath = $RepoPath.Trim()
-if (-not (Test-Path $RepoPath -PathType Container)) {
-    Write-Error "Repo path does not exist or is not a directory: $RepoPath"
-    exit 1
-}
-$RepoPath = (Resolve-Path $RepoPath).Path
-if (-not $RepoName) { $RepoName = [System.IO.Path]::GetFileName($RepoPath) }
+# --- Parse arguments ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo-path)   REPO_PATH="$2";   shift 2 ;;
+    --repo-name)   REPO_NAME="$2";   shift 2 ;;
+    --no-containers) SCAN_CONTAINERS=false; shift ;;
+    *) REPO_PATH="$1"; shift ;;
+  esac
+done
 
-$Date = Get-Date -Format "yyyy-MM-dd"
-$ReportName = "security_scan_${RepoName}_${Date}.md"
-$ReportPath = Join-Path $ReportsDir $ReportName
-$GrypeConfig = Join-Path $ScriptsDir "grype-config.yaml"
+# --- Resolve input ---
+if [[ -z "$REPO_PATH" && -n "${SECURITY_SCAN_REPO_PATH:-}" ]]; then
+  REPO_PATH="$SECURITY_SCAN_REPO_PATH"
+fi
 
-# Ensure output dirs
-if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Path $ReportsDir -Force | Out-Null }
-if (-not (Test-Path $WorkflowDir)) { New-Item -ItemType Directory -Path $WorkflowDir -Force | Out-Null }
+if [[ -z "$REPO_PATH" ]]; then
+  INPUT_FILE="$WORKFLOW_DIR/input.json"
+  if [[ -f "$INPUT_FILE" ]]; then
+    REPO_PATH=$(jq -r '.repoPath // empty' "$INPUT_FILE")
+    [[ -z "$REPO_NAME" ]] && REPO_NAME=$(jq -r '.repoName // empty' "$INPUT_FILE")
+    SCAN_CONTAINERS=$(jq -r '.scanContainers // true' "$INPUT_FILE")
+  fi
+fi
+
+if [[ -z "$REPO_PATH" ]]; then
+  echo "ERROR: Repo path required. Set SECURITY_SCAN_REPO_PATH, pass --repo-path, or set workflow/input.json repoPath." >&2
+  exit 1
+fi
+
+REPO_PATH="${REPO_PATH%/}"
+if [[ ! -d "$REPO_PATH" ]]; then
+  echo "ERROR: Repo path does not exist or is not a directory: $REPO_PATH" >&2
+  exit 1
+fi
+
+REPO_PATH="$(realpath "$REPO_PATH")"
+[[ -z "$REPO_NAME" ]] && REPO_NAME="$(basename "$REPO_PATH")"
+
+DATE="$(date +%Y-%m-%d)"
+REPORT_NAME="security_scan_${REPO_NAME//\//_}_${DATE}.md"
+REPORT_PATH="$REPORTS_DIR/$REPORT_NAME"
+GRYPE_CONFIG="$SCRIPTS_DIR/grype-config.yaml"
+
+mkdir -p "$REPORTS_DIR" "$WORKFLOW_DIR"
 
 # --- Discovery ---
-$Manifests = @()
-$ContainerFiles = @()
-$Images = @()
+MANIFESTS=()
+CONTAINER_FILES=()
 
-if (Test-Path (Join-Path $RepoPath "package.json")) { $Manifests += "node" }
-if (Test-Path (Join-Path $RepoPath "go.mod")) { $Manifests += "go" }
-if (Test-Path (Join-Path $RepoPath "requirements.txt")) { $Manifests += "python" }
-if (Test-Path (Join-Path $RepoPath "Pipfile")) { $Manifests += "python" }
-if (Test-Path (Join-Path $RepoPath "pyproject.toml")) { $Manifests += "python" }
-if (Test-Path (Join-Path $RepoPath "pom.xml")) { $Manifests += "maven" }
-if (Test-Path (Join-Path $RepoPath "Cargo.toml")) { $Manifests += "rust" }
+[[ -f "$REPO_PATH/package.json"    ]] && MANIFESTS+=(node)
+[[ -f "$REPO_PATH/go.mod"          ]] && MANIFESTS+=(go)
+[[ -f "$REPO_PATH/requirements.txt"]] && MANIFESTS+=(python)
+[[ -f "$REPO_PATH/Pipfile"         ]] && MANIFESTS+=(python)
+[[ -f "$REPO_PATH/pyproject.toml"  ]] && MANIFESTS+=(python)
+[[ -f "$REPO_PATH/pom.xml"         ]] && MANIFESTS+=(maven)
+[[ -f "$REPO_PATH/Cargo.toml"      ]] && MANIFESTS+=(rust)
 
-Get-ChildItem -Path $RepoPath -Recurse -Include "Dockerfile","docker-compose*.yml","*.yaml","*.yml" -File -ErrorAction SilentlyContinue | ForEach-Object {
-    $rel = $_.FullName.Substring($RepoPath.Length).TrimStart("\")
-    if ($rel -match "Dockerfile|docker-compose|k8s|helm|charts|deploy|Chart\.yaml|values\.yaml") {
-        $ContainerFiles += $rel
-    }
+while IFS= read -r -d '' file; do
+  rel="${file#$REPO_PATH/}"
+  if echo "$rel" | grep -qE 'Dockerfile|docker-compose|k8s|helm|charts|deploy|Chart\.yaml|values\.yaml'; then
+    CONTAINER_FILES+=("$rel")
+  fi
+done < <(find "$REPO_PATH" -type f \( -name "Dockerfile" -o -name "docker-compose*.yml" -o -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null)
+
+# --- Report helpers ---
+COMMANDS_RUN=()
+FINDINGS_JSON="[]"
+CRITICAL_HIGH=0
+
+append_finding() {
+  local finding="$1" severity="$2" location="$3" affected="$4" fix="$5"
+  FINDINGS_JSON=$(echo "$FINDINGS_JSON" | jq \
+    --arg f "$finding" --arg s "$severity" --arg l "$location" \
+    --arg a "$affected" --arg x "$fix" \
+    '. + [{finding: $f, severity: $s, location: $l, affected: $a, fix: $x}]')
+  if echo "$severity" | grep -qi "critical\|high"; then
+    (( CRITICAL_HIGH++ )) || true
+  fi
 }
 
-# --- Build report and run scans ---
-$CommandsRun = @()
-$Findings = [System.Collections.ArrayList]::new()
-$CriticalHigh = 0
+# --- Start report ---
+{
+cat <<EOF
+# Security Scan Report: $REPO_NAME
 
-$Sb = [System.Text.StringBuilder]::new()
-[void]$Sb.AppendLine("# Security Scan Report: $RepoName")
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("**Date:** $Date")
-[void]$Sb.AppendLine("**Repository:** $RepoPath")
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("## 1) Discovered stack")
-[void]$Sb.AppendLine("- **Manifests:** " + ($Manifests -join ", "))
-[void]$Sb.AppendLine("- **Container-related files:** " + ($ContainerFiles -join ", "))
-[void]$Sb.AppendLine("")
+**Date:** $DATE
+**Repository:** $REPO_PATH
 
-# Node
-if ($Manifests -contains "node") {
-    $pkgPath = Join-Path $RepoPath "package.json"
-    try {
-        Push-Location $RepoPath
-        $auditOut = & npm audit --json 2>&1
-        $CommandsRun += "npm audit --json"
-        $auditObj = $auditOut | ConvertFrom-Json -ErrorAction SilentlyContinue
-        if ($auditObj.vulnerabilities) {
-            foreach ($p in $auditObj.vulnerabilities.PSObject.Properties) {
-                $v = $p.Value
-                $sev = $v.severity
-                if ($sev -eq "critical" -or $sev -eq "high") { $CriticalHigh++ }
-                [void]$Findings.Add([PSCustomObject]@{
-                    Finding = $v.id
-                    Severity = $sev
-                    Location = "package.json"
-                    Affected = $p.Name
-                    Fix = ($v.fixAvailable -eq $true ? "npm update $($p.Name)" : "Review manually")
-                })
-            }
-        }
-        [void]$Sb.AppendLine("### npm audit")
-        [void]$Sb.AppendLine("```")
-        [void]$Sb.AppendLine(($auditOut | Out-String))
-        [void]$Sb.AppendLine("```")
-        [void]$Sb.AppendLine("")
-    } catch {
-        [void]$Sb.AppendLine("### npm audit")
-        [void]$Sb.AppendLine("Error: $_")
-        [void]$Sb.AppendLine("")
-    } finally {
-        Pop-Location
-    }
-}
+## 1) Discovered stack
+- **Manifests:** ${MANIFESTS[*]:-none}
+- **Container-related files:** ${CONTAINER_FILES[*]:-none}
 
-# Grype (filesystem / SBOM)
-$grypeExe = Get-Command grype -ErrorAction SilentlyContinue
-if ($grypeExe -and (Test-Path $GrypeConfig)) {
-    try {
-        $grypeOut = & grype --config $GrypeConfig $RepoPath -o json 2>&1
-        $CommandsRun += "grype --config scripts/grype-config.yaml <repo> -o json"
-        $grypeObj = $grypeOut | ConvertFrom-Json -ErrorAction SilentlyContinue
-        if ($grypeObj.matches) {
-            foreach ($m in $grypeObj.matches) {
-                $sev = $m.vulnerability.severity
-                if ($sev -eq "Critical" -or $sev -eq "High") { $CriticalHigh++ }
-                [void]$Findings.Add([PSCustomObject]@{
-                    Finding = $m.vulnerability.id
-                    Severity = $sev
-                    Location = "filesystem / SBOM"
-                    Affected = $m.artifact.name
-                    Fix = $m.vulnerability.fix.versions -join ", "
-                })
-            }
-        }
-        [void]$Sb.AppendLine("### Grype (filesystem)")
-        [void]$Sb.AppendLine("```")
-        [void]$Sb.AppendLine(($grypeOut | Out-String))
-        [void]$Sb.AppendLine("```")
-        [void]$Sb.AppendLine("")
-    } catch {
-        [void]$Sb.AppendLine("### Grype")
-        [void]$Sb.AppendLine("Error: $_")
-        [void]$Sb.AppendLine("")
-    }
-} else {
-    [void]$Sb.AppendLine("Grype not run (grype not in PATH or config missing).")
-    [void]$Sb.AppendLine("")
-}
+EOF
+} > "$REPORT_PATH"
 
-# Summary table
-[void]$Sb.AppendLine("## 2) Summary table")
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("| Finding | Severity | Location | Affected Package/Image | Fix Suggestion |")
-[void]$Sb.AppendLine("|---------|----------|----------|-------------------------|----------------|")
-foreach ($f in $Findings) {
-    [void]$Sb.AppendLine("| $($f.Finding) | $($f.Severity) | $($f.Location) | $($f.Affected) | $($f.Fix) |")
-}
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("## 3) Prioritized fixes (top critical/high)")
-$top = $Findings | Where-Object { $_.Severity -match "critical|Critical|high|High" } | Select-Object -First 5
-foreach ($f in $top) {
-    [void]$Sb.AppendLine("- **$($f.Severity)** $($f.Finding) in $($f.Affected): $($f.Fix)")
-}
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("## 4) Commands run")
-foreach ($c in $CommandsRun) {
-    [void]$Sb.AppendLine("- $c")
-}
-[void]$Sb.AppendLine("")
-[void]$Sb.AppendLine("## 5) Next steps")
-[void]$Sb.AppendLine("- Review high/critical findings and apply fixes or accept risk.")
-[void]$Sb.AppendLine("- Re-run this workflow after dependency or image updates.")
+# --- npm audit ---
+if [[ " ${MANIFESTS[*]} " == *" node "* ]]; then
+  {
+    echo "### npm audit"
+    echo '```'
+  } >> "$REPORT_PATH"
 
-Set-Content -Path $ReportPath -Value $Sb.ToString() -Encoding UTF8
+  pushd "$REPO_PATH" > /dev/null
+  AUDIT_OUT=$(npm audit --json 2>&1 || true)
+  COMMANDS_RUN+=("npm audit --json")
+
+  echo "$AUDIT_OUT" >> "$REPORT_PATH"
+  echo '```' >> "$REPORT_PATH"
+  echo "" >> "$REPORT_PATH"
+
+  # Parse vulnerabilities
+  if echo "$AUDIT_OUT" | jq -e '.vulnerabilities' > /dev/null 2>&1; then
+    while IFS= read -r pkg; do
+      sev=$(echo "$AUDIT_OUT" | jq -r --arg p "$pkg" '.vulnerabilities[$p].severity')
+      vid=$(echo "$AUDIT_OUT" | jq -r --arg p "$pkg" '.vulnerabilities[$p].via[0].source // .vulnerabilities[$p].via[0] // "unknown"')
+      fix_available=$(echo "$AUDIT_OUT" | jq -r --arg p "$pkg" '.vulnerabilities[$p].fixAvailable')
+      fix="Review manually"
+      [[ "$fix_available" == "true" ]] && fix="npm update $pkg"
+      append_finding "$vid" "$sev" "package.json" "$pkg" "$fix"
+    done < <(echo "$AUDIT_OUT" | jq -r '.vulnerabilities | keys[]')
+  fi
+  popd > /dev/null
+fi
+
+# --- Grype ---
+if command -v grype > /dev/null 2>&1 && [[ -f "$GRYPE_CONFIG" ]]; then
+  {
+    echo "### Grype (filesystem)"
+    echo '```'
+  } >> "$REPORT_PATH"
+
+  GRYPE_OUT=$(grype --config "$GRYPE_CONFIG" "$REPO_PATH" -o json 2>&1 || true)
+  COMMANDS_RUN+=("grype --config scripts/grype-config.yaml <repo> -o json")
+
+  echo "$GRYPE_OUT" >> "$REPORT_PATH"
+  echo '```' >> "$REPORT_PATH"
+  echo "" >> "$REPORT_PATH"
+
+  if echo "$GRYPE_OUT" | jq -e '.matches' > /dev/null 2>&1; then
+    while IFS=$'\t' read -r vid sev name fix_versions; do
+      append_finding "$vid" "$sev" "filesystem / SBOM" "$name" "$fix_versions"
+    done < <(echo "$GRYPE_OUT" | jq -r '.matches[] | [.vulnerability.id, .vulnerability.severity, .artifact.name, (.vulnerability.fix.versions | join(","))] | @tsv')
+  fi
+else
+  echo "Grype not run (grype not in PATH or config missing)." >> "$REPORT_PATH"
+  echo "" >> "$REPORT_PATH"
+fi
+
+# --- Summary table ---
+{
+echo "## 2) Summary table"
+echo ""
+echo "| Finding | Severity | Location | Affected Package/Image | Fix Suggestion |"
+echo "|---------|----------|----------|------------------------|----------------|"
+echo "$FINDINGS_JSON" | jq -r '.[] | "| \(.finding) | \(.severity) | \(.location) | \(.affected) | \(.fix) |"'
+echo ""
+
+echo "## 3) Prioritized fixes (top critical/high)"
+echo "$FINDINGS_JSON" | jq -r '.[] | select(.severity | test("critical|high"; "i")) | "- **\(.severity)** \(.finding) in \(.affected): \(.fix)"' | head -5
+echo ""
+
+echo "## 4) Commands run"
+for cmd in "${COMMANDS_RUN[@]}"; do echo "- $cmd"; done
+echo ""
+
+echo "## 5) Next steps"
+echo "- Review high/critical findings and apply fixes or accept risk."
+echo "- Re-run this workflow after dependency or image updates."
+} >> "$REPORT_PATH"
 
 # --- Workflow output for n8n ---
-$output = @{
-    repoPath   = $RepoPath
-    repoName   = $RepoName
-    reportPath = $ReportPath
-    reportName = $ReportName
-    date       = $Date
-    totalFindings = $Findings.Count
-    criticalHigh  = $CriticalHigh
-    commandsRun   = $CommandsRun
-}
-$outputPath = Join-Path $WorkflowDir "output.json"
-$output | ConvertTo-Json -Depth 5 | Set-Content -Path $outputPath -Encoding UTF8
+COMMANDS_JSON=$(printf '%s\n' "${COMMANDS_RUN[@]}" | jq -R . | jq -s .)
+TOTAL_FINDINGS=$(echo "$FINDINGS_JSON" | jq 'length')
 
-Write-Host "Report: $ReportPath"
-Write-Host "Findings: $($Findings.Count) (critical+high: $CriticalHigh)"
-Write-Host "Output: $outputPath"
+jq -n \
+  --arg repoPath "$REPO_PATH" \
+  --arg repoName "$REPO_NAME" \
+  --arg reportPath "$REPORT_PATH" \
+  --arg reportName "$REPORT_NAME" \
+  --arg date "$DATE" \
+  --argjson totalFindings "$TOTAL_FINDINGS" \
+  --argjson criticalHigh "$CRITICAL_HIGH" \
+  --argjson commandsRun "$COMMANDS_JSON" \
+  '{repoPath: $repoPath, repoName: $repoName, reportPath: $reportPath, reportName: $reportName,
+    date: $date, totalFindings: $totalFindings, criticalHigh: $criticalHigh, commandsRun: $commandsRun}' \
+  > "$WORKFLOW_DIR/output.json"
+
+echo "Report:   $REPORT_PATH"
+echo "Findings: $TOTAL_FINDINGS (critical+high: $CRITICAL_HIGH)"
+echo "Output:   $WORKFLOW_DIR/output.json"

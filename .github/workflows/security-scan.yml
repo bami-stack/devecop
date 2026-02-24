@@ -1,13 +1,18 @@
 name: Repository Security Scan
-
 on:
-  schedule:
-    - cron: "0 2 * * *"   # Nightly at 2AM UTC
+  repository_dispatch:
+    types: [security_scan]
+
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Repository URL from n8n"
+        required: true
+
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,33 +21,31 @@ permissions:
 jobs:
   security-scan:
     name: Run Vulnerability Scan
-    runs-on: windows-latest
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node (for npm audit if needed)
+      - name: Show Input
+        run: |
+          echo "Repo URL: ${{ github.event.inputs.repo_url }}"
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install Grype
-        shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://raw.githubusercontent.com/anchore/grype/main/install.ps1 -OutFile install-grype.ps1
-          .\install-grype.ps1 -InstallDir $env:USERPROFILE\bin
-          echo "$env:USERPROFILE\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Verify Grype installation
         run: grype version
-        shell: pwsh
 
       - name: Run Security Scan Script
-        shell: pwsh
         run: |
-          $env:SECURITY_SCAN_REPO_PATH = "${{ github.workspace }}"
-          .\security-scan.ps1 -RepoName "${{ github.repository }}"
+          export SECURITY_SCAN_REPO_PATH="${{ github.workspace }}"
+          bash security-scan.sh --repo-name "${{ github.repository }}"
 
       - name: Upload Security Report
         uses: actions/upload-artifact@v4
@@ -56,14 +59,30 @@ jobs:
           name: workflow-output
           path: workflow/output.json
 
-      - name: Fail if High/Critical Found
-        shell: pwsh
+      - name: Prepare JSON for n8n
         run: |
-          $output = Get-Content workflow/output.json | ConvertFrom-Json
-          if ($output.criticalHigh -gt 0) {
-            Write-Error "High/Critical vulnerabilities detected."
+          jq \
+            --arg repo "${{ github.repository }}" \
+            --arg repo_url "${{ github.event.inputs.repo_url }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg workflow "${{ github.workflow }}" \
+            '. + {repo: $repo, repo_url: $repo_url, run_id: $run_id, workflow: $workflow}' \
+            workflow/output.json > workflow/output-final.json
+
+      - name: Send results to n8n
+        run: |
+          curl -fsSL \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @workflow/output-final.json \
+            "https://n8ndev.dedamdata.org/webhook/27bc0c35-a997-45a6-b97c-28f430487a6a"
+
+      - name: Fail if High/Critical Found
+        run: |
+          CRITICAL_HIGH=$(jq '.criticalHigh' workflow/output.json)
+          if [ "$CRITICAL_HIGH" -gt 0 ]; then
+            echo "::error::High/Critical vulnerabilities detected: $CRITICAL_HIGH"
             exit 1
-          } else {
-            Write-Host "No high/critical vulnerabilities."
-          }
-        
+          else
+            echo "No high/critical vulnerabilities found."
+          fi
